@@ -5,7 +5,8 @@
 #include <CoilData.h>
 #include <AccelStepper.h>
 #include <ESP32_Servo.h>
-#include <DRV8825.h>
+// #include <DRV8825.h>
+#include "esp32-hal-ledc.h"
 
 /*
 ToDo:
@@ -14,8 +15,6 @@ ToDo:
 2. pembuatan diagram blok dan flow chart yang lebih baik
 
 */
-
-
 
 #define pin_dir 32
 #define pin_step 33
@@ -63,6 +62,8 @@ bool coilTrigger = false;
 Servo myServo1;
 Servo myServo2;
 int pos = 0;
+
+bool onceSetSpeed[2] = {true, false}; // onceSetSpeed[0] = manual, onceSetSpeed[1] = Auto
 // const int pinServo = 19;
 
 uint32_t lastMillis;
@@ -195,8 +196,10 @@ ModbusMessage FC06(ModbusMessage request)
 
   return response;
 }
+
 //====================================================================
 int millisServo;
+int swingPos = 60;
 void servoBack(Servo &servo)
 {
   if (millis() - millisServo > 5)
@@ -213,7 +216,7 @@ void servoSwing(Servo &servo)
 {
   if (millis() - millisServo > 5)
   {
-    if (pos < 180)
+    if (pos < swingPos)
     {
       pos += 1;
       servo.write(pos);
@@ -222,10 +225,33 @@ void servoSwing(Servo &servo)
   }
 }
 
-bool stateServoSwing1 = true;
-bool stateServoSwing2 = true;
+bool fruitDetect[3];
 
+bool stateServoSwing1 = false;  // ketika ada buah mentah
+bool stateServoSwing2 = false;  // ketika ada buah 1/2 matang
+bool stateServoNoSwing = false; // ketika ada buah matang
+
+bool backSwing1 = false;
+bool backSwing2 = false;
+
+bool start_system = false;
 // bool stateServoBack = false;
+uint32_t auto_speed_slow = 500;
+uint32_t auto_speed_fast = 1000;
+
+uint32_t prevSpeed = 0;
+
+uint32_t timeOutSwingServo1 = 15000;
+uint32_t timeOutSwingServo2 = 10000;
+uint32_t timeOutNoSwing = 5000;
+
+uint32_t timeMillisChangeSpeedF0F1 = 20000;
+uint32_t timeMillisChangeSpeedF2 = 40000;
+
+uint32_t millisServoSwing;
+uint32_t millisServoBack;
+uint32_t millisAutoMan;
+uint32_t millisSpeedMotor;
 
 void setup()
 {
@@ -253,30 +279,28 @@ void setup()
   MBserver.registerWorker(1, WRITE_COIL, &FC_05);
   MBserver.registerWorker(1, READ_COIL, &FC_01);
 
+  myServo1.write(0);
+  delay(500);
+  myServo2.write(0);
+  
   MBserver.start(502, 1, 20000);
   lastMillis = millis();
 
   stepper.setMaxSpeed(1000);
-  stepper.setSpeed(100);
+  stepper.setSpeed(500);
 
   millisServo = millis();
+  millisAutoMan = millis();
+  myCoils.set(6, false);
+  Serial.println("Process Start");
+
 }
-// bool stateTimeSwingServo1;
-// bool stateTimeSwingServo2;
-
-// bool stateTimeBackServo;
-/*
-*/
-uint32_t timeOutSwingServo1 = 1000;
-uint32_t timeOutSwingServo2 = 2000;
-
-uint32_t millisServoSwing;
-uint32_t millisServoBack;
 
 void loop()
 {
-  //baca data serial yang dikirim pc 
- 
+  // stepper.runSpeed();
+  // baca data serial yang dikirim pc
+
   /*
   List data:
   <0>: Mentah
@@ -284,76 +308,173 @@ void loop()
   <2>: Matang
   */
 
-  if (Serial.available()){
-    String data = Serial.readStringUntil('>');
-    data = data.substring(0,2);
-    Serial.println("isi data: " + data);
-    if (data=="0"){
-      if (!stateServoSwing1){
-        servoSwing(myServo1);
-        stateServoSwing1 = true;
-        millisServoSwing = millis();
-        stateServoSwing1 = true;
-        data = "";
-        Serial.println("ada mentah");
-      }
-    }else if(data=="1"){
-      if (!stateServoSwing2){
-        servoSwing(myServo2);
-        stateServoSwing2 = true;
-        millisServoSwing = millis();
-        stateServoSwing2 = true;
-        data = "";
-        Serial.println("ada 1/2 matang");
-      }
-    }else if(data=="2"){
-      Serial.println("ada matang");
-    }
-  }
+  /*memori register
+  memo[0] = total buah yang lewat
+  memo[3] = total mentah
+  memo[2] = total 1/2 mateng
+  memo[1] = total mateng
+  */
+  //==============================================================================================================================================
 
-  if (stateServoSwing1){
-    if (millis()-millisServoSwing>=timeOutSwingServo1){
-      servoBack(myServo1);
-      stateServoSwing1 = false;
-      Serial.println("servor swing");
-    }
-  }else if (stateServoSwing2){
-    if (millis()-millisServoSwing>=timeOutSwingServo2){
-      servoBack(myServo2);
-      stateServoSwing2 = false;
-      Serial.println("servor back");
-    }
-  }
-
-
-
-
-
-
-  //=======================
-  if (myCoils[0]==true){
-    Serial.println("system ON");
-  }else{
-    Serial.println("system OFF");
-  }
-
-  stepper.runSpeed();
-
-  if (millis() - lastMillis > 1000)//asli 10000
+  if (myCoils[0])
   {
-    lastMillis = millis();
-    Serial.printf("free heap: %d\n", ESP.getFreeHeap());
-    Serial.printf("nilai Hreg: %d", memo[0]);
-    memo[0] += 100;
-    stepper.setSpeed(500);
+
+    if (Serial.available() > 0)
+    {
+      String data = Serial.readStringUntil('>');
+      data = data.substring(1, 2);
+      Serial.println("isi data: " + data);
+      if (data == "0")
+      {
+        // fruitDetect[0] = true;
+        // servoSwing(myServo1);
+        if (!stateServoSwing1)
+        {
+          if (!myCoils[6])
+          { // ketika myCoils[6] = false => maka mode yang berjalan Auto
+            stepper.setSpeed(auto_speed_fast);
+            memo[6] = auto_speed_fast / 10;
+          }
+          stateServoSwing1 = true;
+          myCoils.set(1, true);
+          millisServoSwing = millis();
+          memo[3] += 1;
+          memo[0] += 1;
+          data = "-";
+          Serial.println("==============================");
+          Serial.println("ada mentah");
+          Serial.println("==============================");
+          for (int i = 0; i < 60; i++)
+          {
+            myServo1.write(i);
+            delay(7);
+          }
+        }
+      }
+      else if (data == "1")
+      {
+        // fruitDetect[1] = true;
+        if (!stateServoSwing2)
+        {
+          // servoSwing(myServo2);
+
+          if (!myCoils[6])
+          { // ketika myCoils[6] = false => maka mode yang berjalan Auto
+            stepper.setSpeed(auto_speed_fast);
+            memo[6] = auto_speed_fast / 10;
+          }
+
+          stateServoSwing2 = true;
+          myCoils.set(2, true);
+          millisServoSwing = millis();
+          memo[2] += 1;
+          memo[0] += 1;
+          data = "-";
+          Serial.println("==============================");
+          Serial.println("ada 1/2 matang");
+          Serial.println("==============================");
+          for (int i = 0; i < 60; i++)
+          {
+            myServo2.write(i);
+            delay(7);
+          }
+        }
+      }
+      else if (data == "2")
+      {
+        // fruitDetect[2] = true;
+        memo[1] += 1;
+        memo[0] += 1;
+
+        if (!myCoils[6])
+        { // ketika myCoils[6] = false => maka mode yang berjalan Auto
+          stepper.setSpeed(auto_speed_fast);
+          memo[6] = auto_speed_fast / 10;
+          millisServoSwing = millis();
+        }
+        data = "-";
+        stateServoNoSwing = true;
+        Serial.println("ada matang");
+      }
+    }
+    //==============================================================================================================================================
+
+    if (stateServoSwing1)
+    {
+      if (millis() - millisServoSwing >= timeOutSwingServo1)
+      {
+        backSwing1 = true;
+        stepper.setSpeed(auto_speed_slow);
+        memo[6] = auto_speed_slow / 10;
+        stateServoSwing1 = false;
+        myCoils.set(1, false);
+        Serial.println("==============================");
+        Serial.println("servor 1 back");
+        Serial.println("==============================");
+        for (int i = 60; i > 0; i--)
+        {
+          myServo1.write(i);
+          delay(7);
+        }
+        swingPos = 60;
+      }
+    }
+    else if (stateServoSwing2)
+    {
+
+      if (millis() - millisServoSwing >= timeOutSwingServo2)
+      {
+        backSwing2 = true;
+        stepper.setSpeed(auto_speed_slow);
+        memo[6] = auto_speed_slow / 10;
+        stateServoSwing2 = false;
+        myCoils.set(2, false);
+        Serial.println("==============================");
+        Serial.println("servor 2 back");
+        Serial.println("==============================");
+        for (int i = 60; i > 0; i--)
+        {
+          myServo2.write(i);
+          delay(7);
+        }
+        swingPos = 60;
+      }
+    }
+    else if (stateServoNoSwing)
+    {
+      if (millis() - millisServoSwing >= timeOutNoSwing)
+      {
+        stepper.setSpeed(auto_speed_slow);
+        memo[6] = auto_speed_slow / 10;
+        stateServoNoSwing = false;
+        Serial.println("==============================");
+        Serial.println("servor 1 dan 2 normal position");
+        Serial.println("==============================");
+      }
+    }
+    //==============================================================================================================================================
+
+    if (millis() - lastMillis > 1000) // asli 10000
+    {
+      lastMillis = millis();
+      Serial.println("System Run");
+      ESP.getFreeHeap();
+      if (myCoils[6]) // jika manual maka register yang menyimpan speed akan dicek ketika prev speed berbeda dengan nilai register sekarang makan akan diperbarui nilainya
+      {
+        if (memo[6] != prevSpeed)
+        {
+          prevSpeed = memo[6];
+          stepper.setSpeed(memo[6] * 10); // kenapa dikali 10 karena pada slider hanya 1-100 sedangkan speed 10(sudah lamban) sampai 1000
+        }
+        Serial.println("Speed Manual = " + String(memo[6]));
+      }
+      else
+      {
+        Serial.println("Spedd Auto = " + String(memo[6]));
+      }
+    }
+    //==============================================================================================================================================
+
+    stepper.runSpeed();
   }
-  // int modul = memo[0] / 100;
-  // if (modul % 2 != 0)
-  // {
-  //   servoSwing();
-  // }
-  // else
-  // {
-  //   servoBack();
-  // }
 }
